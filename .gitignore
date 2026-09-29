@@ -1,0 +1,24 @@
+# Secrets -- never commit
+email_config.py
+
+# Local environment
+venv/
+__pycache__/
+*.pyc
+
+# Local data (personal solve history) and its backups
+problems.db
+problems.db.bak-*
+
+# Scraper debug artifacts
+debug_out/
+
+# Daily-email launchd job logs
+daily_email.log
+daily_email.err.log
+
+# OS cruft
+.DS_Store
+
+# Large local media
+*.mov

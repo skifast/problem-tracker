@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.problemtracker.dailyemail</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/valeriehetherington/Desktop/Problem Tracker Application/venv/bin/python3</string>
+        <string>/Users/valeriehetherington/Desktop/Problem Tracker Application/send_daily_email.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/valeriehetherington/Desktop/Problem Tracker Application</string>
+
+    <!-- Fires daily at 7:00 AM. Only fires if the Mac is awake at that
+         moment -- there's no server here, just this machine, so a sleeping
+         laptop simply misses that day's email rather than catching up. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/valeriehetherington/Desktop/Problem Tracker Application/daily_email.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/valeriehetherington/Desktop/Problem Tracker Application/daily_email.err.log</string>
+</dict>
+</plist>
