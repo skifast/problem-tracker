@@ -8,10 +8,14 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
+import coach
+from blind75 import BLIND_75, BLIND_75_EXTRAS
+
 DESKTOP   = Path(__file__).parent
 DB_PATH   = DESKTOP / "problems.db"
 CAPACITY_OPTIONS = [3, 5, 8, 12, 20]
 OVERDUE_DISPLAY_OPTIONS = [10, 20, 30, 50, 100]
+SET_DISPLAY_OPTIONS = [3, 5, 10, 20]
 MAX_PER_CATEGORY_PCT_OPTIONS = [20, 40, 60, 80, 100]
 DEFAULT_MAX_PER_CATEGORY_PCT = 40
 
@@ -38,6 +42,17 @@ def init_db():
                 reviewed_at TEXT NOT NULL,
                 result      TEXT NOT NULL,
                 notes       TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS weekly_reports (
+                week       TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                report     TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS coach_notes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                problem_url TEXT NOT NULL REFERENCES problems(url) ON DELETE CASCADE,
+                created_at  TEXT NOT NULL,
+                diagnosis   TEXT NOT NULL
             );
         """)
 
@@ -102,10 +117,14 @@ def load_catalog() -> pd.DataFrame:
     not -- the pool "recommend new problems" draws from. Tolerates a
     problems.db from before this table existed (or one whose catalog scrape
     just hasn't run yet): returns empty rather than crashing the dashboard."""
-    columns = ["url", "name", "category", "difficulty", "source"]
+    columns = ["url", "name", "category", "difficulty", "source", "completed"]
     with db() as con:
         try:
-            return pd.read_sql_query(f"SELECT {', '.join(columns)} FROM catalog", con)
+            # `completed` (NeetCode's checkbox) only exists once tracker.py
+            # has run since it was added; default to 0 until then.
+            present = {r[1] for r in con.execute("PRAGMA table_info(catalog)")}
+            select = ", ".join(c if c in present else f"0 AS {c}" for c in columns)
+            return pd.read_sql_query(f"SELECT {select} FROM catalog ORDER BY rowid", con)
         except (sqlite3.OperationalError, pd.errors.DatabaseError):
             return pd.DataFrame(columns=columns)
 
@@ -113,7 +132,7 @@ def reviewed_today() -> set:
     today = date.today().isoformat()
     with db() as con:
         rows = con.execute(
-            "SELECT DISTINCT problem_url FROM review_history WHERE date(reviewed_at)=?",
+            "SELECT DISTINCT problem_url FROM review_history WHERE date(reviewed_at, 'localtime')=?",
             (today,),
         ).fetchall()
     return {r[0] for r in rows}
@@ -134,12 +153,89 @@ def ensure_tracked(url: str, name: str, category: str, source: str = "neetcode")
             (url, name, category, now, now, source),
         )
 
+def set_starred(url: str, name: str, category: str, source: str, starred: bool):
+    """Star/unstar from the dashboard. Writes the same problems.starred column
+    NeetCode's own star populates, so scoring and every query treat both alike.
+    ensure_tracked first, since cards can come from the untracked catalog."""
+    ensure_tracked(url, name, category, source)
+    with db() as con:
+        con.execute("UPDATE problems SET starred=? WHERE url=?", (int(starred), url))
+
 def record_review(url: str, result: str, notes: str = ""):
     with db() as con:
         con.execute(
             "INSERT INTO review_history (problem_url, reviewed_at, result, notes) VALUES (?,?,?,?)",
             (url, datetime.utcnow().isoformat(), result, notes),
         )
+
+def problem_history(url: str, n: int = coach.HISTORY_LIMIT) -> list:
+    """Most recent reviews of one problem, newest first."""
+    with db() as con:
+        rows = con.execute(
+            "SELECT reviewed_at, result, notes FROM review_history "
+            "WHERE problem_url=? ORDER BY id DESC LIMIT ?", (url, n),
+        ).fetchall()
+    return [{"reviewed_at": r[0], "result": r[1], "notes": r[2]} for r in rows]
+
+def save_coach_note(url: str, diagnosis: str):
+    with db() as con:
+        con.execute(
+            "INSERT INTO coach_notes (problem_url, created_at, diagnosis) VALUES (?,?,?)",
+            (url, datetime.utcnow().isoformat(), diagnosis),
+        )
+
+def latest_coach_note(url: str) -> Optional[tuple]:
+    """(date, diagnosis) of the newest coaching note for a problem, or None."""
+    with db() as con:
+        row = con.execute(
+            "SELECT created_at, diagnosis FROM coach_notes WHERE problem_url=? "
+            "ORDER BY id DESC LIMIT 1", (url,),
+        ).fetchone()
+    return (row[0][:10], row[1]) if row else None
+
+def run_coach(url: str, name: str, category: str, difficulty, result: str, note: str) -> Optional[str]:
+    """Diagnose a Hint/Failed attempt and store the result. Returns an error
+    message to show the user, or None on success. Call after record_review so
+    the attempt itself is excluded from the earlier-attempts context."""
+    history = problem_history(url, coach.HISTORY_LIMIT + 1)[1:]
+    try:
+        diagnosis = coach.diagnose(name, category, difficulty, result, note, history)
+    except coach.CoachError as e:
+        return str(e)
+    save_coach_note(url, diagnosis)
+    return None
+
+def week_key(d: date) -> str:
+    year, week, _ = d.isocalendar()
+    return f"{year}-W{week:02d}"
+
+def get_weekly_report(week: str) -> Optional[str]:
+    with db() as con:
+        row = con.execute("SELECT report FROM weekly_reports WHERE week=?", (week,)).fetchone()
+    return row[0] if row else None
+
+def save_weekly_report(week: str, report: str):
+    with db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO weekly_reports (week, created_at, report) VALUES (?,?,?)",
+            (week, datetime.utcnow().isoformat(), report),
+        )
+
+def reviews_since(days: int = 7) -> list:
+    """Review attempts from the last `days` days, newest first, with the
+    problem's name/category attached."""
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT h.reviewed_at, h.result, h.notes, p.name, p.category
+            FROM review_history h JOIN problems p ON p.url = h.problem_url
+            WHERE date(h.reviewed_at, 'localtime') >= ? ORDER BY h.id DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+    keys = ("reviewed_at", "result", "notes", "name", "category")
+    return [dict(zip(keys, r)) for r in rows]
 
 def recent_history(n: int = 30) -> pd.DataFrame:
     with db() as con:
@@ -169,11 +265,21 @@ def parse_date(val) -> Optional[date]:
             continue
     return None
 
+# Problems last touched before this are a weaker signal of current skill, so
+# their staleness counts for less. Age is uncapped, so a flat bonus for recent
+# problems would be swamped by a years-old problem's age term; scaling the age
+# term down lets recent work compete.
+RECENT_CUTOFF = date(2024, 1, 1)
+OLD_AGE_WEIGHT = 0.25
+
 def score_row(row) -> float:
     ref = parse_date(row.get("last_reviewed")) or parse_date(row.get("last_accepted"))
     age = (date.today() - ref).days if ref else 999
 
-    s = float(age) * 2.0
+    dates = [d for d in (parse_date(row.get("last_reviewed")), parse_date(row.get("last_accepted"))) if d]
+    is_recent = bool(dates) and max(dates) >= RECENT_CUTOFF
+
+    s = float(age) * 2.0 * (1.0 if is_recent else OLD_AGE_WEIGHT)
 
     if row.get("starred"):
         s += 10
@@ -298,6 +404,67 @@ def recommend_new_problems(
 
     return pd.concat(selected, ignore_index=True).drop(columns="_diff_rank")
 
+PROBLEM_SETS = ["All", "NeetCode 150", "Blind 75"]
+
+def _norm_name(name) -> str:
+    """Lowercase alphanumerics only, so 'Best Time to Buy And Sell Stock' (NeetCode)
+    matches 'Best Time To Buy And Sell Stock' (title-cased from a LeetCode slug)."""
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+def problem_set_catalog(catalog_df: pd.DataFrame, problem_set: str) -> pd.DataFrame:
+    """Catalog rows belonging to a curated list, in curriculum (catalog) order.
+    NeetCode 150 is the scraped NeetCode catalog itself; Blind 75 is picked out
+    of it by name, with BLIND_75_EXTRAS appended for the problems NeetCode 150
+    doesn't carry."""
+    if problem_set == "NeetCode 150":
+        return catalog_df[catalog_df["source"] == "neetcode"].reset_index(drop=True)
+    if problem_set == "Blind 75":
+        wanted = {_norm_name(n) for n in BLIND_75}
+        picked = catalog_df[catalog_df["name"].map(_norm_name).isin(wanted)]
+        have = set(picked["name"].map(_norm_name))
+        extras = [
+            {"url": url, "name": name, "category": cat, "difficulty": diff, "source": "leetcode"}
+            for name, (url, cat, diff) in BLIND_75_EXTRAS.items()
+            if _norm_name(name) not in have
+        ]
+        return pd.concat([picked, pd.DataFrame(extras, columns=catalog_df.columns)], ignore_index=True)
+    return catalog_df.reset_index(drop=True)
+
+def hide_reviewed_today(todo: pd.DataFrame, reviewed: set) -> tuple:
+    """(visible, hidden_count): drops anything attempted today (Failed, Hint or
+    Skip, not just Solved) so it comes back tomorrow, same as Today's Queue
+    and Overdue treat reviewed_today()."""
+    if todo.empty:
+        return todo, 0
+    attempted = todo["url"].isin(reviewed)
+    return todo[~attempted].reset_index(drop=True), int(attempted.sum())
+
+def app_solved_urls() -> set:
+    """URLs you explicitly clicked Solved on in this app."""
+    with db() as con:
+        rows = con.execute("SELECT DISTINCT problem_url FROM review_history WHERE result='Solved'").fetchall()
+    return {r[0] for r in rows}
+
+def next_in_set(set_df: pd.DataFrame, problems_df: pd.DataFrame, app_solved: frozenset = frozenset()) -> tuple:
+    """(todo, done_count) for a curated list, todo in list order. NeetCode
+    problems are done when their checkbox on NeetCode is ticked (catalog.completed,
+    refreshed by tracker.py) or you clicked Solved on them here -- but not merely
+    because of passive solve history (e.g. LeetCode submissions). Rows from elsewhere
+    (e.g. Blind 75's LeetCode-only extras) have no checkbox, so they fall back to
+    a recorded solve, matched by URL or normalized name."""
+    if set_df.empty:
+        return set_df, 0
+    solved = problems_df[(problems_df["solved_count"] > 0) | problems_df["last_accepted"].notna()]
+    solved_by_history = set_df["url"].isin(set(solved["url"])) | set_df["name"].map(_norm_name).isin(
+        {_norm_name(n) for n in solved["name"]}
+    )
+    checked = set_df["completed"].fillna(0).astype(int) == 1 if "completed" in set_df else False
+    is_done = (
+        (set_df["source"] == "neetcode") & (checked | set_df["url"].isin(app_solved))
+        | (set_df["source"] != "neetcode") & solved_by_history
+    )
+    return set_df[~is_done].reset_index(drop=True), int(is_done.sum())
+
 # ── UI helpers ────────────────────────────────────────────────────────────────
 
 def show_dataframe(data: pd.DataFrame, **kwargs):
@@ -367,16 +534,24 @@ def render_card(row, key_suffix: str, reason: str = ""):
     if reason:
         st.caption(f"💡 {reason}")
     st.caption(f"Last seen: {last_rev} · Solved {solved}× · Struggled {struggled}×")
+    coach_note = latest_coach_note(url)
+    if coach_note:
+        st.info(f"🧑‍🏫 **Coach ({coach_note[0]}):** {coach_note[1]}")
     link_label = "Open on LeetCode ↗" if source == "leetcode" else "Open in NeetCode ↗"
     st.markdown(f"[{link_label}]({url})")
 
     with st.form(key=f"form_{key_suffix}_{url}"):
         notes = st.text_input("Notes", placeholder="What tripped you up? (optional)")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         solved_btn = c1.form_submit_button("✅ Solved")
         hint_btn   = c2.form_submit_button("💡 Hint")
         failed_btn = c3.form_submit_button("❌ Failed")
         skip_btn   = c4.form_submit_button("⏭ Skip")
+        star_btn   = c5.form_submit_button("☆ Unstar" if starred else "⭐ Star")
+
+    if star_btn:
+        set_starred(url, name, cat, source, not starred)
+        st.rerun()
 
     if solved_btn or hint_btn or failed_btn or skip_btn:
         # Cards can come from `catalog` (a recommended problem never before
@@ -385,16 +560,20 @@ def render_card(row, key_suffix: str, reason: str = ""):
         ensure_tracked(url, name, cat, source)
     if solved_btn:
         record_review(url, "Solved", notes)
-        st.experimental_rerun()
-    if hint_btn:
-        record_review(url, "Hint", notes)
-        st.experimental_rerun()
-    if failed_btn:
-        record_review(url, "Failed", notes)
-        st.experimental_rerun()
+        st.rerun()
+    for clicked, result in ((hint_btn, "Hint"), (failed_btn, "Failed")):
+        if clicked:
+            record_review(url, result, notes)
+            # The note is the signal worth sending; skip the API call without one.
+            if notes.strip():
+                with st.spinner("Coach is reviewing your attempt…"):
+                    err = run_coach(url, name, cat, row.get("difficulty"), result, notes)
+                if err:
+                    st.session_state["coach_error"] = err
+            st.rerun()
     if skip_btn:
         record_review(url, "Skip", notes)
-        st.experimental_rerun()
+        st.rerun()
 
     st.markdown("---")
 
@@ -413,6 +592,8 @@ def main():
         return "One of your weaker patterns by struggle rate" if category in weak_top else ""
 
     st.title("🧠 NeetCode Spaced Repetition")
+    if coach_error := st.session_state.pop("coach_error", None):
+        st.warning(f"Coach unavailable: {coach_error}")
     st.caption(f"{len(df)} problems tracked · {len(done)} reviewed today")
 
     tab_queue, tab_recommend, tab_overdue, tab_browse, tab_stats = st.tabs([
@@ -446,13 +627,35 @@ def main():
                 "catalog (not just problems you've solved), then reload."
             )
         else:
-            new_recs = recommend_new_problems(catalog_df, df, weak_df)
-            if new_recs.empty:
-                st.success("No gaps found — every catalogued problem is already tracked!")
+            problem_set = st.radio("Problem set", PROBLEM_SETS, horizontal=True)
+            if problem_set == "All":
+                new_recs = recommend_new_problems(catalog_df, df, weak_df)
+                if new_recs.empty:
+                    st.success("No gaps found — every catalogued problem is already tracked!")
+                else:
+                    st.write(f"**{len(new_recs)} suggestions**, prioritizing untouched and weak patterns")
+                    for _, row in new_recs.iterrows():
+                        render_card(row, "rec", reason=row.get("reason", ""))
             else:
-                st.write(f"**{len(new_recs)} suggestions**, prioritizing untouched and weak patterns")
-                for _, row in new_recs.iterrows():
-                    render_card(row, "rec", reason=row.get("reason", ""))
+                set_df = problem_set_catalog(catalog_df, problem_set)
+                todo, done_n = next_in_set(set_df, df, app_solved_urls())
+                todo, hidden_n = hide_reviewed_today(todo, done)
+                st.progress(done_n / len(set_df) if len(set_df) else 0.0)
+                st.caption(f"{done_n} of {len(set_df)} {problem_set} problems solved")
+                if hidden_n:
+                    st.caption(f"{hidden_n} attempted today — back tomorrow")
+                if todo.empty:
+                    if hidden_n:
+                        st.success("Nothing left for today — attempted problems return tomorrow.")
+                    else:
+                        st.success(f"🎉 You've solved every {problem_set} problem!")
+                else:
+                    # Same widget-count concern as the overdue tab: each card is a
+                    # full form, so only render the next few, in list order.
+                    show_n = st.select_slider("Show next N", options=SET_DISPLAY_OPTIONS, value=5)
+                    st.write(f"**Next up in {problem_set}** — {len(todo)} to go")
+                    for _, row in todo.head(show_n).iterrows():
+                        render_card(row, f"set_{problem_set}")
 
         st.subheader("📉 Your weakest patterns")
         if weak_df.empty:
@@ -529,10 +732,10 @@ def main():
 
         with db() as con:
             today_n = con.execute(
-                "SELECT COUNT(*) FROM review_history WHERE date(reviewed_at)=?", (today_str,)
+                "SELECT COUNT(*) FROM review_history WHERE date(reviewed_at, 'localtime')=?", (today_str,)
             ).fetchone()[0]
             week_n  = con.execute(
-                "SELECT COUNT(*) FROM review_history WHERE date(reviewed_at)>=?", (week_ago,)
+                "SELECT COUNT(*) FROM review_history WHERE date(reviewed_at, 'localtime')>=?", (week_ago,)
             ).fetchone()[0]
             total_n = con.execute("SELECT COUNT(*) FROM review_history").fetchone()[0]
 

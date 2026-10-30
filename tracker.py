@@ -277,6 +277,25 @@ SLUG_ALIASES = {
     "validate-binary-search-tree": "valid-binary-search-tree",
     "walls-and-gates": "islands-and-treasure",
     "word-search": "search-for-word",
+
+    # Same failure again for these 15 (difficulty NULL because the lookup
+    # fell back to the NeetCode spelling). Found by listing catalog rows
+    # with no difficulty after a full sync.
+    "minimum-window-substring": "minimum-window-with-characters",
+    "construct-binary-tree-from-preorder-and-inorder-traversal": "binary-tree-from-preorder-and-inorder-traversal",
+    "design-twitter": "design-twitter-feed",
+    "find-median-from-data-stream": "find-median-in-a-data-stream",
+    "word-search-ii": "search-for-word-ii",
+    "reconstruct-itinerary": "reconstruct-flight-path",
+    "min-cost-to-connect-all-points": "min-cost-to-connect-points",
+    "alien-dictionary": "foreign-dictionary",
+    "cheapest-flights-within-k-stops": "cheapest-flight-path",
+    "best-time-to-buy-and-sell-stock-with-cooldown": "buy-and-sell-crypto-with-cooldown",
+    "longest-increasing-path-in-a-matrix": "longest-increasing-path-in-matrix",
+    "distinct-subsequences": "count-subsequences",
+    "merge-triplets-to-form-target-triplet": "merge-triplets-to-form-target",
+    "minimum-interval-to-include-each-query": "minimum-interval-including-query",
+    "detect-squares": "count-squares",
 }
 
 
@@ -327,7 +346,8 @@ def init_db():
             category   TEXT NOT NULL,
             difficulty TEXT,
             source     TEXT NOT NULL DEFAULT 'neetcode',
-            last_seen  TEXT NOT NULL
+            last_seen  TEXT NOT NULL,
+            completed  INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS accepted_dates (
             problem_url   TEXT NOT NULL REFERENCES problems(url) ON DELETE CASCADE,
@@ -351,6 +371,11 @@ def init_db():
 
     try:
         con.execute("ALTER TABLE problems ADD COLUMN topics TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    try:
+        con.execute("ALTER TABLE catalog ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # column already exists
 
@@ -451,7 +476,10 @@ def save_row(row):
     scrape run can't wipe problems that were already recorded. first_seen is
     preserved across runs; everything else reflects the latest scrape.
     source is fixed to 'neetcode' -- this path is only ever used for
-    problems read straight off NeetCode's own practice list."""
+    problems read straight off NeetCode's own practice list.
+    starred is OR-ed with the stored value rather than overwritten: a star
+    set from the dashboard has no NeetCode-side counterpart, so a plain
+    overwrite would wipe it on the next crawl."""
     name, category, url, starred, last_accepted, last_seen = row
 
     con = sqlite3.connect(DB_PATH)
@@ -462,7 +490,7 @@ def save_row(row):
         ON CONFLICT(url) DO UPDATE SET
             name          = excluded.name,
             category      = excluded.category,
-            starred       = excluded.starred,
+            starred       = MAX(problems.starred, excluded.starred),
             last_accepted = excluded.last_accepted,
             last_seen     = excluded.last_seen
     """, (url, name, category, starred, last_accepted, last_seen, last_seen))
@@ -476,19 +504,22 @@ def save_catalog_row(row):
     Independent of `problems` (which only ever holds problems that have
     been solved): this is "everything that exists", so the dashboard can
     diff it against `problems` to recommend problems not yet attempted.
-    Never deletes, for the same partial-scrape-safety reason as save_row."""
-    name, category, url, last_seen = row
+    Never deletes, for the same partial-scrape-safety reason as save_row.
+    `completed` is NeetCode's own checkbox state and is overwritten every
+    scrape, so unchecking a problem on NeetCode is reflected too."""
+    name, category, url, completed, last_seen = row
 
     con = sqlite3.connect(DB_PATH)
     con.execute("PRAGMA foreign_keys = ON")
     con.execute("""
-        INSERT INTO catalog (url, name, category, source, last_seen)
-        VALUES (?, ?, ?, 'neetcode', ?)
+        INSERT INTO catalog (url, name, category, source, last_seen, completed)
+        VALUES (?, ?, ?, 'neetcode', ?, ?)
         ON CONFLICT(url) DO UPDATE SET
             name      = excluded.name,
             category  = excluded.category,
-            last_seen = excluded.last_seen
-    """, (url, name, category, last_seen))
+            last_seen = excluded.last_seen,
+            completed = excluded.completed
+    """, (url, name, category, last_seen, completed))
 
     con.commit()
     con.close()
@@ -975,7 +1006,7 @@ def main():
         print(f"Found {len(catalog)} NeetCode catalog problems, {len(completed)} completed.")
 
         for entry in catalog:
-            save_catalog_row((entry["name"], entry["category"], entry["url"], now))
+            save_catalog_row((entry["name"], entry["category"], entry["url"], int(entry["completed"]), now))
 
         for i, problem in enumerate(completed, start=1):
             print(f"[{i}/{len(completed)}] {problem['name']}")

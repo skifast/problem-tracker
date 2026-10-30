@@ -7,3 +7,6 @@ pandas==3.0.5
 
 # After installing, playwright also needs its browser binary:
 #   playwright install chromium
+
+# AI coaching layer (coach.py) -- needs ANTHROPIC_API_KEY at runtime
+anthropic==2.3.0

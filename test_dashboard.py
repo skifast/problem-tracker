@@ -64,7 +64,17 @@ class TestParseDate(unittest.TestCase):
 class TestScoreRow(unittest.TestCase):
     def test_never_reviewed_uses_default_age_of_999(self):
         row = make_row()
-        self.assertEqual(dash.score_row(row), 999 * 2.0)
+        self.assertEqual(dash.score_row(row), 999 * 2.0 * dash.OLD_AGE_WEIGHT)
+
+    def test_pre_2024_activity_has_discounted_age_weight(self):
+        old = make_row(last_accepted="12/31/2023")
+        age = (date.today() - date(2023, 12, 31)).days
+        self.assertEqual(dash.score_row(old), age * 2.0 * dash.OLD_AGE_WEIGHT)
+
+    def test_activity_since_2024_has_full_age_weight(self):
+        row = make_row(last_accepted="01/01/2024")
+        age = (date.today() - date(2024, 1, 1)).days
+        self.assertEqual(dash.score_row(row), age * 2.0)
 
     def test_reviewed_today_has_zero_age_component(self):
         row = make_row(last_reviewed=date.today().isoformat())
@@ -393,6 +403,48 @@ class TestLoadProblemsSolvedCount(unittest.TestCase):
     def _row_for_url(self, df):
         return df[df["url"] == self.URL].iloc[0]
 
+    def test_set_starred_stars_and_unstars_tracked_problem(self):
+        self._seed_problem()
+        dash.set_starred(self.URL, "Two Sum", "Arrays & Hashing", "leetcode", True)
+        self.assertEqual(self._row_for_url(dash.load_problems())["starred"], 1)
+        dash.set_starred(self.URL, "Two Sum", "Arrays & Hashing", "leetcode", False)
+        self.assertEqual(self._row_for_url(dash.load_problems())["starred"], 0)
+
+    def test_set_starred_tracks_untracked_catalog_problem(self):
+        dash.set_starred(self.URL, "Two Sum", "Arrays & Hashing", "leetcode", True)
+        self.assertEqual(self._row_for_url(dash.load_problems())["starred"], 1)
+
+    def test_dashboard_star_survives_tracker_rescrape_that_reports_unstarred(self):
+        self._seed_problem()
+        dash.set_starred(self.URL, "Two Sum", "Arrays & Hashing", "leetcode", True)
+        t.save_row(("Two Sum", "Arrays & Hashing", self.URL, 0, None, datetime.now().isoformat()))
+        self.assertEqual(self._row_for_url(dash.load_problems())["starred"], 1)
+
+    def test_neetcode_star_still_propagates_on_rescrape(self):
+        self._seed_problem()
+        t.save_row(("Two Sum", "Arrays & Hashing", self.URL, 1, None, datetime.now().isoformat()))
+        self.assertEqual(self._row_for_url(dash.load_problems())["starred"], 1)
+
+    def test_reviewed_today_uses_local_date_not_utc_date(self):
+        # review_history stores UTC; "today" is the local calendar day. In any
+        # zone whose date differs from UTC's right now (always true for one of
+        # these two extremes) a review made just now must still count as today.
+        import os, time
+        self._seed_problem()
+        dash.record_review(self.URL, "Failed", "")
+        orig_tz = os.environ.get("TZ")
+        try:
+            for tz in ("Pacific/Pago_Pago", "Pacific/Kiritimati", "UTC"):
+                os.environ["TZ"] = tz
+                time.tzset()
+                self.assertIn(self.URL, dash.reviewed_today(), tz)
+        finally:
+            if orig_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = orig_tz
+            time.tzset()
+
     def test_platform_accepted_date_counts_even_with_zero_app_reviews(self):
         # The exact bug report this fixes: solved on LeetCode/NeetCode,
         # never clicked "Solved" in the app -- should not show 0.
@@ -463,6 +515,106 @@ class TestLoadProblemsSolvedCount(unittest.TestCase):
 
         df = dash.load_problems()  # must not raise on the missing table
         self.assertEqual(self._row_for_url(df)["solved_count"], 1)
+
+
+class TestProblemSets(unittest.TestCase):
+    def _catalog(self, names):
+        return pd.DataFrame([
+            make_catalog_row(url=f"https://neetcode.io/problems/{i}", name=n)
+            for i, n in enumerate(names)
+        ])
+
+    def _problems(self, rows):
+        cols = ["url", "name", "solved_count", "last_accepted"]
+        return pd.DataFrame([make_row(**r) for r in rows])[cols] if rows else pd.DataFrame(columns=cols)
+
+    def test_all_returns_whole_catalog(self):
+        cat = self._catalog(["Two Sum", "Not In Blind"])
+        self.assertEqual(len(dash.problem_set_catalog(cat, "All")), 2)
+
+    def test_neetcode_150_excludes_leetcode_only_rows(self):
+        cat = pd.DataFrame([
+            make_catalog_row(url="a", name="A"),
+            make_catalog_row(url="b", name="B", source="leetcode"),
+        ])
+        self.assertEqual(list(dash.problem_set_catalog(cat, "NeetCode 150")["url"]), ["a"])
+
+    def test_blind_75_filters_by_name_keeping_catalog_order(self):
+        cat = self._catalog(["Valid Anagram", "Not In Blind", "Two Sum"])
+        result = dash.problem_set_catalog(cat, "Blind 75")
+        names = list(result["name"])
+        self.assertEqual(names[:2], ["Valid Anagram", "Two Sum"])
+        self.assertNotIn("Not In Blind", names)
+
+    def test_blind_75_name_match_ignores_case_and_punctuation(self):
+        cat = self._catalog(["best time to buy and sell stock"])
+        self.assertIn("best time to buy and sell stock", list(dash.problem_set_catalog(cat, "Blind 75")["name"]))
+
+    def test_blind_75_appends_extra_missing_from_neetcode_catalog(self):
+        result = dash.problem_set_catalog(self._catalog(["Two Sum"]), "Blind 75")
+        self.assertIn("Combination Sum IV", list(result["name"]))
+
+    def test_blind_75_has_75_unique_entries(self):
+        from blind75 import BLIND_75
+        self.assertEqual(len({dash._norm_name(n) for n in BLIND_75}), 75)
+
+    def test_neetcode_problem_done_only_when_checkbox_ticked(self):
+        set_df = self._catalog(["Two Sum", "Valid Anagram"])
+        set_df["completed"] = [1, 0]
+        todo, done_n = dash.next_in_set(set_df, self._problems([]))
+        self.assertEqual(list(todo["name"]), ["Valid Anagram"])
+        self.assertEqual(done_n, 1)
+
+    def test_neetcode_problem_with_history_but_unchecked_stays_in_todo(self):
+        set_df = self._catalog(["Two Sum"])
+        set_df["completed"] = [0]
+        probs = self._problems([{"url": "https://neetcode.io/problems/0", "name": "Two Sum",
+                                 "solved_count": 3, "last_accepted": "2025-01-01"}])
+        todo, done_n = dash.next_in_set(set_df, probs)
+        self.assertEqual(len(todo), 1)
+        self.assertEqual(done_n, 0)
+
+    def test_in_app_solved_click_marks_unchecked_neetcode_problem_done(self):
+        set_df = self._catalog(["Two Sum", "Valid Anagram"])
+        set_df["completed"] = [0, 0]
+        todo, done_n = dash.next_in_set(set_df, self._problems([]), frozenset({"https://neetcode.io/problems/0"}))
+        self.assertEqual(list(todo["name"]), ["Valid Anagram"])
+        self.assertEqual(done_n, 1)
+
+    def test_problems_attempted_today_are_hidden_and_counted(self):
+        todo = self._catalog(["Two Sum", "Valid Anagram", "3Sum"])
+        visible, hidden_n = dash.hide_reviewed_today(todo, {"https://neetcode.io/problems/1"})
+        self.assertEqual(list(visible["name"]), ["Two Sum", "3Sum"])
+        self.assertEqual(hidden_n, 1)
+
+    def test_hide_reviewed_today_with_nothing_attempted_changes_nothing(self):
+        todo = self._catalog(["Two Sum"])
+        visible, hidden_n = dash.hide_reviewed_today(todo, set())
+        self.assertEqual(len(visible), 1)
+        self.assertEqual(hidden_n, 0)
+
+    def test_hide_reviewed_today_handles_empty_list(self):
+        visible, hidden_n = dash.hide_reviewed_today(self._catalog([]), {"x"})
+        self.assertTrue(visible.empty)
+        self.assertEqual(hidden_n, 0)
+
+    def test_checked_problem_is_done_without_any_history(self):
+        set_df = self._catalog(["Two Sum"])
+        set_df["completed"] = [1]
+        todo, done_n = dash.next_in_set(set_df, self._problems([]))
+        self.assertTrue(todo.empty)
+
+    def test_missing_completed_column_treats_neetcode_rows_as_not_done(self):
+        todo, done_n = dash.next_in_set(self._catalog(["Two Sum"]), self._problems([]))
+        self.assertEqual(len(todo), 1)
+
+    def test_non_neetcode_row_falls_back_to_solve_history(self):
+        set_df = pd.DataFrame([make_catalog_row(url="https://leetcode.com/problems/x/", name="X", source="leetcode")])
+        set_df["completed"] = [0]
+        probs = self._problems([{"url": "https://leetcode.com/problems/x/", "name": "X", "solved_count": 1}])
+        todo, done_n = dash.next_in_set(set_df, probs)
+        self.assertTrue(todo.empty)
+        self.assertEqual(done_n, 1)
 
 
 if __name__ == "__main__":
