@@ -439,6 +439,39 @@ def hide_reviewed_today(todo: pd.DataFrame, reviewed: set) -> tuple:
     attempted = todo["url"].isin(reviewed)
     return todo[~attempted].reset_index(drop=True), int(attempted.sum())
 
+RANK_POOL = 15
+
+def apply_ranking(todo: pd.DataFrame, ranking: list) -> pd.DataFrame:
+    """Reorder `todo` by a stored AI ranking [{"url", "reason"}, ...] and attach
+    each reason. Ranked problems that are no longer to-do (solved or attempted
+    since) drop out; anything the ranking never saw keeps its list order at the end."""
+    if todo.empty or not ranking:
+        return todo
+    by_url = {r["url"]: r["reason"] for r in ranking}
+    order = {r["url"]: i for i, r in enumerate(ranking)}
+    out = todo.copy()
+    out["reason"] = out["url"].map(by_url).fillna("")
+    out["_rank"] = out["url"].map(order).fillna(len(order))
+    return out.sort_values("_rank", kind="stable").drop(columns="_rank").reset_index(drop=True)
+
+def ai_rank(todo: pd.DataFrame, set_df: pd.DataFrame, weak_df: pd.DataFrame) -> tuple:
+    """(ranking, error): Claude's order for the next RANK_POOL to-do problems,
+    as stored-friendly dicts. error is a user-facing message, or None."""
+    pool = todo.head(RANK_POOL)
+    if pool.empty:
+        return [], None
+    remaining = todo.groupby("category").size().to_dict()
+    totals = set_df.groupby("category").size().to_dict()
+    progress = {c: (totals[c] - remaining.get(c, 0), totals[c]) for c in totals}
+    candidates = pool[["name", "category", "difficulty"]].to_dict("records")
+    weak_rows = weak_df.head(3).to_dict("records") if not weak_df.empty else []
+    try:
+        ranked = coach.rank_candidates(candidates, weak_rows, progress)
+    except coach.CoachError as e:
+        return [], str(e)
+    urls = list(pool["url"])
+    return [{"url": urls[i], "reason": reason} for i, reason in ranked], None
+
 def app_solved_urls() -> set:
     """URLs you explicitly clicked Solved on in this app."""
     with db() as con:
@@ -640,6 +673,17 @@ def main():
                 set_df = problem_set_catalog(catalog_df, problem_set)
                 todo, done_n = next_in_set(set_df, df, app_solved_urls())
                 todo, hidden_n = hide_reviewed_today(todo, done)
+
+                rank_key = f"ai_rank_{problem_set}"
+                if st.button("✨ Rank with AI", help="Order the next problems by your weak spots and prerequisites"):
+                    with st.spinner("Claude is ranking your next problems…"):
+                        ranking, err = ai_rank(todo, set_df, weak_df)
+                    if err:
+                        st.warning(f"AI ranking unavailable: {err}")
+                    else:
+                        st.session_state[rank_key] = ranking
+                if st.session_state.get(rank_key):
+                    todo = apply_ranking(todo, st.session_state[rank_key])
                 st.progress(done_n / len(set_df) if len(set_df) else 0.0)
                 st.caption(f"{done_n} of {len(set_df)} {problem_set} problems solved")
                 if hidden_n:
@@ -655,7 +699,7 @@ def main():
                     show_n = st.select_slider("Show next N", options=SET_DISPLAY_OPTIONS, value=5)
                     st.write(f"**Next up in {problem_set}** — {len(todo)} to go")
                     for _, row in todo.head(show_n).iterrows():
-                        render_card(row, f"set_{problem_set}")
+                        render_card(row, f"set_{problem_set}", reason=row.get("reason", ""))
 
         st.subheader("📉 Your weakest patterns")
         if weak_df.empty:

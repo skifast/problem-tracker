@@ -175,6 +175,107 @@ class TestWeeklyPrompt(unittest.TestCase):
         self.assertEqual(client.calls[0]["system"], coach.WEEKLY_SYSTEM_PROMPT)
 
 
+def json_client(payload):
+    import json
+    return fake_client(text=json.dumps(payload))
+
+
+class TestRankCandidates(unittest.TestCase):
+    CANDS = [
+        {"name": "A", "category": "Trees", "difficulty": "Easy"},
+        {"name": "B", "category": "Graphs", "difficulty": "Medium"},
+        {"name": "C", "category": "Trees", "difficulty": "Hard"},
+    ]
+
+    def rank(self, order):
+        return coach.rank_candidates(self.CANDS, [], {}, client=json_client({"order": order}))
+
+    def test_returns_models_order_with_reasons(self):
+        got = self.rank([{"id": 2, "reason": "weak"}, {"id": 0, "reason": "warmup"}, {"id": 1, "reason": "later"}])
+        self.assertEqual(got, [(2, "weak"), (0, "warmup"), (1, "later")])
+
+    def test_omitted_candidates_are_appended_in_original_order(self):
+        got = self.rank([{"id": 2, "reason": "x"}])
+        self.assertEqual([i for i, _ in got], [2, 0, 1])
+
+    def test_unknown_and_repeated_ids_are_dropped(self):
+        got = self.rank([{"id": 9, "reason": "?"}, {"id": 1, "reason": "a"}, {"id": 1, "reason": "dup"}, {"id": -1, "reason": "?"}])
+        self.assertEqual([i for i, _ in got], [1, 0, 2])
+        self.assertEqual(got[0][1], "a")
+
+    def test_unparseable_reply_becomes_coach_error(self):
+        with self.assertRaises(coach.CoachError):
+            coach.rank_candidates(self.CANDS, [], {}, client=fake_client(text="not json"))
+
+    def test_request_is_schema_constrained(self):
+        client = json_client({"order": []})
+        coach.rank_candidates(self.CANDS, [], {}, client=client)
+        fmt = client.calls[0]["output_config"]["format"]
+        self.assertEqual(fmt["type"], "json_schema")
+        self.assertEqual(fmt["schema"], coach.RANK_SCHEMA)
+        self.assertEqual(client.calls[0]["output_config"]["effort"], "medium")
+
+    def test_prompt_lists_ids_weak_patterns_and_progress(self):
+        p = coach.build_rank_prompt(
+            self.CANDS, [{"category": "Trees", "attempts": 6, "weakness": 0.5}], {"Trees": (1, 4)}
+        )
+        self.assertIn("0: A [Trees, Easy]", p)
+        self.assertIn("Trees: 50% over 6 attempts", p)
+        self.assertIn("Trees: 1/4", p)
+
+
+class TestDashboardRanking(unittest.TestCase):
+    def todo(self):
+        return pd.DataFrame([
+            {"url": f"u{i}", "name": n, "category": c, "difficulty": "Easy", "source": "neetcode"}
+            for i, (n, c) in enumerate([("A", "Trees"), ("B", "Graphs"), ("C", "Trees")])
+        ])
+
+    def test_apply_ranking_reorders_and_attaches_reasons(self):
+        out = dash.apply_ranking(self.todo(), [{"url": "u2", "reason": "weak"}, {"url": "u0", "reason": "easy"}])
+        self.assertEqual(list(out["url"]), ["u2", "u0", "u1"])
+        self.assertEqual(list(out["reason"]), ["weak", "easy", ""])
+
+    def test_apply_ranking_drops_ranked_problems_no_longer_todo(self):
+        todo = self.todo().iloc[1:]  # u0 was solved since ranking
+        out = dash.apply_ranking(todo, [{"url": "u0", "reason": "x"}, {"url": "u2", "reason": "y"}])
+        self.assertEqual(list(out["url"]), ["u2", "u1"])
+
+    def test_apply_ranking_without_ranking_is_unchanged(self):
+        self.assertEqual(list(dash.apply_ranking(self.todo(), [])["url"]), ["u0", "u1", "u2"])
+
+    def test_ai_rank_maps_model_indexes_back_to_urls_and_computes_progress(self):
+        seen = {}
+        orig = coach.rank_candidates
+
+        def fake(cands, weak, progress):
+            seen.update(cands=cands, progress=progress)
+            return [(1, "weak"), (0, "")]
+
+        coach.rank_candidates = fake
+        try:
+            set_df = self.todo()                      # 3 in list: 2 Trees, 1 Graphs
+            ranking, err = dash.ai_rank(self.todo().iloc[1:], set_df, pd.DataFrame())  # A solved
+        finally:
+            coach.rank_candidates = orig
+        self.assertIsNone(err)
+        self.assertEqual(seen["progress"], {"Trees": (1, 2), "Graphs": (0, 1)})
+        self.assertEqual(ranking, [{"url": "u2", "reason": "weak"}, {"url": "u1", "reason": ""}])
+
+    def test_ai_rank_returns_error_message_on_coach_failure(self):
+        orig = coach.rank_candidates
+
+        def boom(*a, **k):
+            raise coach.CoachError("no key")
+
+        coach.rank_candidates = boom
+        try:
+            ranking, err = dash.ai_rank(self.todo(), self.todo(), pd.DataFrame())
+        finally:
+            coach.rank_candidates = orig
+        self.assertEqual((ranking, err), ([], "no key"))
+
+
 class TestWeeklyEmail(unittest.TestCase):
     SUNDAY = date(2026, 11, 1)   # weekday() == 6
     MONDAY = date(2026, 11, 2)
